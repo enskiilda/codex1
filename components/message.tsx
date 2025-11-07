@@ -1,7 +1,7 @@
 "use client";
 
 import type { ComponentType } from "react";
-import { useEffect, useRef, memo } from "react";
+import { useRef } from "react";
 import { Markdown } from "./markdown";
 import { ABORTED, cn } from "@/lib/utils";
 import {

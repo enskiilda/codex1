@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import { memo } from "react";
 
 interface InputProps {
   input: string;
@@ -19,7 +18,7 @@ const SendIcon = (props: React.SVGProps<SVGSVGElement>) => (
   </svg>
 );
 
-export const Input = memo(function Input({
+export function Input({
   input,
   handleInputChange,
   isInitializing,
@@ -90,4 +89,4 @@ export const Input = memo(function Input({
       </div>
     </div>
   );
-});
+}

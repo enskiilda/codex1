@@ -1,39 +1,85 @@
 "use client";
 
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 import { RealtimeMessage } from "@/components/realtime-message";
 import { getDesktopURL } from "@/lib/e2b/utils";
 import { useScrollToBottom } from "@/lib/use-scroll-to-bottom";
 import { useRawStreaming } from "@/lib/use-raw-streaming";
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useRef, useSyncExternalStore, type ChangeEvent, type FormEvent } from "react";
 import { Input } from "@/components/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { AISDKLogo } from "@/components/icons";
 import { PromptSuggestions } from "@/components/prompt-suggestions";
-import { ABORTED } from "@/lib/utils";
+
+type UIState = {
+  isDesktopView: boolean;
+  isInitializing: boolean;
+  streamUrl: string | null;
+  sandboxId: string | null;
+  isSubmitted: boolean;
+};
+
+type UIListener = () => void;
+
+class UIStore {
+  private state: UIState = {
+    isDesktopView: false,
+    isInitializing: true,
+    streamUrl: null,
+    sandboxId: null,
+    isSubmitted: false,
+  };
+
+  private listeners = new Set<UIListener>();
+
+  subscribe = (listener: UIListener) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
+  getSnapshot = () => this.state;
+
+  setDesktopView(value: boolean) {
+    this.update({ isDesktopView: value });
+  }
+
+  setInitializing(value: boolean) {
+    this.update({ isInitializing: value });
+  }
+
+  updateStream(streamUrl: string | null, sandboxId: string | null) {
+    this.update({ streamUrl, sandboxId });
+  }
+
+  setSubmitted(value: boolean) {
+    this.update({ isSubmitted: value });
+  }
+
+  private update(partial: Partial<UIState>) {
+    this.state = { ...this.state, ...partial };
+    this.listeners.forEach((listener) => listener());
+  }
+}
 
 export default function Chat() {
   const [desktopContainerRef, desktopEndRef] = useScrollToBottom();
   const [mobileContainerRef, mobileEndRef] = useScrollToBottom();
-  const [isDesktopView, setIsDesktopView] = useState(false);
 
-  const [isInitializing, setIsInitializing] = useState(true);
-  const [streamUrl, setStreamUrl] = useState<string | null>(null);
-  const [sandboxId, setSandboxId] = useState<string | null>(null);
+  const uiStoreRef = useRef<UIStore>();
+  if (!uiStoreRef.current) {
+    uiStoreRef.current = new UIStore();
+  }
+  const uiStore = uiStoreRef.current;
+  const uiState = useSyncExternalStore(uiStore.subscribe, uiStore.getSnapshot, uiStore.getSnapshot);
 
-  const {
-    messages,
-    input,
-    setInput,
-    handleSubmit,
-    isStreaming,
-    stop: originalStop,
-    send,
-  } = useRawStreaming({
+  const { messages, input, setInput, handleSubmit, isStreaming, stop: rawStop, send } = useRawStreaming({
     api: "/api/chat",
-    body: {
-      sandboxId,
-    },
+    body: { sandboxId: uiState.sandboxId },
     onError: (error) => {
       console.error(error);
       toast.error("There was an error", {
@@ -44,125 +90,127 @@ export default function Chat() {
     },
   });
 
-  const [isSubmitted, setIsSubmitted] = useState(false);
+  const stopStream = () => {
+    uiStore.setSubmitted(false);
+    rawStop();
+  };
 
-  const stop = useCallback(() => {
-    setIsSubmitted(false);
-    originalStop();
-  }, [originalStop]);
+  const handleInputChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(event.target.value);
+  };
 
-  const handleInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement> | React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInput(e.target.value);
-  }, [setInput]);
+  const handleFormSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!input.trim() || isStreaming || uiState.isInitializing) {
+      return;
+    }
+    uiStore.setSubmitted(true);
+    handleSubmit(event);
+  };
 
-  const handleFormSubmit = useCallback((e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isStreaming || isInitializing) return;
-    setIsSubmitted(true);
-    handleSubmit(e);
-  }, [input, isStreaming, isInitializing, handleSubmit]);
+  const handlePromptSubmit = (prompt: string) => {
+    if (!prompt.trim() || isStreaming || uiState.isInitializing) {
+      return;
+    }
+    uiStore.setSubmitted(true);
+    void send(prompt);
+  };
 
-  // Reset submitted state when streaming starts or ends
+  const refreshDesktop = async () => {
+    try {
+      uiStore.setInitializing(true);
+      const currentSandbox = uiStore.getSnapshot().sandboxId ?? undefined;
+      const { streamUrl, id } = await getDesktopURL(currentSandbox);
+      uiStore.updateStream(streamUrl, id);
+    } catch (error) {
+      console.error("Failed to refresh desktop:", error);
+    } finally {
+      uiStore.setInitializing(false);
+    }
+  };
+
   useEffect(() => {
     if (isStreaming) {
-      setIsSubmitted(false); // Reset when streaming actually starts
+      uiStore.setSubmitted(false);
     }
-  }, [isStreaming]);
+  }, [isStreaming, uiStore]);
 
-  const isLoading = useMemo(() => isStreaming || isSubmitted, [isStreaming, isSubmitted]);
-  const status = useMemo(() => isStreaming ? "streaming" : isSubmitted ? "submitted" : "ready", [isStreaming, isSubmitted]);
-
-  const refreshDesktop = useCallback(async () => {
-    try {
-      setIsInitializing(true);
-      const { streamUrl, id } = await getDesktopURL(sandboxId || undefined);
-      setStreamUrl(streamUrl);
-      setSandboxId(id);
-    } catch (err) {
-      console.error("Failed to refresh desktop:", err);
-    } finally {
-      setIsInitializing(false);
-    }
-  }, [sandboxId]);
-
-  const handlePromptSubmit = useCallback((prompt: string) => {
-    setIsSubmitted(true);
-    send(prompt);
-  }, [send]);
-
-  // Kill desktop on page close
   useEffect(() => {
-    if (!sandboxId) return;
-
-    // Function to kill the desktop - just one method to reduce duplicates
-    const killDesktop = () => {
-      if (!sandboxId) return;
-
-      // Use sendBeacon which is best supported across browsers
-      navigator.sendBeacon(
-        `/api/kill-desktop?sandboxId=${encodeURIComponent(sandboxId)}`,
-      );
+    const checkViewport = () => {
+      uiStore.setDesktopView(window.innerWidth >= 1280);
     };
 
-    // Detect iOS / Safari
+    checkViewport();
+    window.addEventListener("resize", checkViewport);
+    return () => window.removeEventListener("resize", checkViewport);
+  }, [uiStore]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const init = async () => {
+      try {
+        uiStore.setInitializing(true);
+        const { streamUrl, id } = await getDesktopURL();
+        if (cancelled) {
+          return;
+        }
+        uiStore.updateStream(streamUrl, id);
+      } catch (error) {
+        console.error("Failed to initialize desktop:", error);
+        if (!cancelled) {
+          toast.error("Failed to initialize desktop");
+        }
+      } finally {
+        if (!cancelled) {
+          uiStore.setInitializing(false);
+        }
+      }
+    };
+
+    void init();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [uiStore]);
+
+  useEffect(() => {
+    const sandboxId = uiState.sandboxId;
+    if (!sandboxId) {
+      return;
+    }
+
+    const killDesktop = () => {
+      navigator.sendBeacon(`/api/kill-desktop?sandboxId=${encodeURIComponent(sandboxId)}`);
+    };
+
     const isIOS =
       /iPad|iPhone|iPod/.test(navigator.userAgent) ||
       (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
     const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
-    // Choose exactly ONE event handler based on the browser
     if (isIOS || isSafari) {
-      // For Safari on iOS, use pagehide which is most reliable
       window.addEventListener("pagehide", killDesktop);
-
       return () => {
         window.removeEventListener("pagehide", killDesktop);
-        // Also kill desktop when component unmounts
-        killDesktop();
-      };
-    } else {
-      // For all other browsers, use beforeunload
-      window.addEventListener("beforeunload", killDesktop);
-
-      return () => {
-        window.removeEventListener("beforeunload", killDesktop);
-        // Also kill desktop when component unmounts
         killDesktop();
       };
     }
-  }, [sandboxId]);
 
-  useEffect(() => {
-    const checkViewport = () => {
-      setIsDesktopView(window.innerWidth >= 1280);
+    window.addEventListener("beforeunload", killDesktop);
+    return () => {
+      window.removeEventListener("beforeunload", killDesktop);
+      killDesktop();
     };
-    
-    checkViewport();
-    window.addEventListener('resize', checkViewport);
-    return () => window.removeEventListener('resize', checkViewport);
-  }, []);
+  }, [uiState.sandboxId]);
 
-  useEffect(() => {
-    const init = async () => {
-      try {
-        setIsInitializing(true);
-        const { streamUrl, id } = await getDesktopURL(sandboxId ?? undefined);
-        setStreamUrl(streamUrl);
-        setSandboxId(id);
-      } catch (err) {
-        console.error("Failed to initialize desktop:", err);
-        toast.error("Failed to initialize desktop");
-      } finally {
-        setIsInitializing(false);
-      }
-    };
-
-    init();
-  }, []);
+  const isLoading = isStreaming || uiState.isSubmitted;
+  const status = isStreaming ? "streaming" : uiState.isSubmitted ? "submitted" : "ready";
 
   return (
     <div className="flex h-dvh relative">
-      {isDesktopView ? (
+      {uiState.isDesktopView ? (
         <div className="w-full flex h-full">
           <div className="w-96 flex flex-col border-r border-border">
             <div className="bg-background py-2 px-4 flex justify-between items-center">
@@ -187,7 +235,7 @@ export default function Chat() {
 
             {messages.length === 0 && (
               <PromptSuggestions
-                disabled={isInitializing}
+                disabled={uiState.isInitializing}
                 submitPrompt={handlePromptSubmit}
               />
             )}
@@ -196,20 +244,20 @@ export default function Chat() {
                 <Input
                   handleInputChange={handleInputChange}
                   input={input}
-                  isInitializing={isInitializing}
+                  isInitializing={uiState.isInitializing}
                   isLoading={isLoading}
                   status={status}
-                  stop={stop}
+                  stop={stopStream}
                 />
               </form>
             </div>
           </div>
 
           <div className="flex-1 bg-black relative flex items-center justify-center">
-            {streamUrl ? (
+            {uiState.streamUrl ? (
               <>
                 <iframe
-                  src={streamUrl}
+                  src={uiState.streamUrl}
                   className="w-full h-full"
                   style={{
                     transformOrigin: "center",
@@ -221,14 +269,14 @@ export default function Chat() {
                 <Button
                   onClick={refreshDesktop}
                   className="absolute top-2 right-2 bg-black/50 hover:bg-black/70 text-white px-3 py-1 rounded text-sm z-10"
-                  disabled={isInitializing}
+                  disabled={uiState.isInitializing}
                 >
-                  {isInitializing ? "Creating desktop..." : "New desktop"}
+                  {uiState.isInitializing ? "Creating desktop..." : "New desktop"}
                 </Button>
               </>
             ) : (
               <div className="flex items-center justify-center h-full text-white">
-                {isInitializing
+                {uiState.isInitializing
                   ? "Initializing desktop..."
                   : "Loading stream..."}
               </div>
@@ -259,7 +307,7 @@ export default function Chat() {
 
           {messages.length === 0 && (
             <PromptSuggestions
-              disabled={isInitializing}
+              disabled={uiState.isInitializing}
               submitPrompt={handlePromptSubmit}
             />
           )}
@@ -268,10 +316,10 @@ export default function Chat() {
               <Input
                 handleInputChange={handleInputChange}
                 input={input}
-                isInitializing={isInitializing}
+                isInitializing={uiState.isInitializing}
                 isLoading={isLoading}
                 status={status}
-                stop={stop}
+                stop={stopStream}
               />
             </form>
           </div>

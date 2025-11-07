@@ -1,25 +1,33 @@
 import type { NextConfig } from "next";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+
+process.env.NEXT_TELEMETRY_DISABLED = "1";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  
+  cacheHandler: require.resolve("./lib/noop-cache-handler"),
+  cacheMaxMemorySize: 0,
+  cleanDistDir: true,
+  generateEtags: false,
+  env: {
+    NEXT_TELEMETRY_DISABLED: "1",
+  },
+
   generateBuildId: async () => {
     return `no-cache-${Date.now()}-${Math.random().toString(36).substring(7)}`;
   },
-  
+
   images: {
     unoptimized: true,
   },
-  
+
   onDemandEntries: {
     maxInactiveAge: 0,
     pagesBufferLength: 0,
   },
-  
-  experimental: {
-    optimizePackageImports: ['lucide-react', '@radix-ui/react-dialog', '@radix-ui/react-label', '@radix-ui/react-slot', '@radix-ui/react-tooltip'],
-  },
-  
+
   async headers() {
     return [
       {
