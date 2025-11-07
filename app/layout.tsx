@@ -2,9 +2,8 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/sonner";
-import { Analytics } from "@vercel/analytics/react"
-import { DisableAllStorage } from "@/components/disable-all-storage"
-import { PreventChatCaching } from "@/components/prevent-chat-caching"
+import { DisableAllStorage } from "@/components/disable-all-storage";
+import { PreventChatCaching } from "@/components/prevent-chat-caching";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -41,7 +40,6 @@ export default function RootLayout({
         <PreventChatCaching />
         {children}
         <Toaster />
-        <Analytics />
       </body>
     </html>
   );

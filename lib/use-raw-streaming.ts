@@ -1,13 +1,19 @@
 "use client";
 
-import { useState, useRef } from "react";
-import { flushSync } from "react-dom";
+import type React from "react";
+import { useRef, useSyncExternalStore } from "react";
 
-type Message = {
+export type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
   parts?: any[];
+};
+
+type StreamingState = {
+  messages: Message[];
+  input: string;
+  isStreaming: boolean;
 };
 
 type UseRawStreamingOptions = {
@@ -16,300 +22,334 @@ type UseRawStreamingOptions = {
   onError?: (error: Error) => void;
 };
 
-export function useRawStreaming(options: UseRawStreamingOptions) {
-  const { api, body, onError } = options;
-  
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const messagesRef = useRef<Message[]>([]);
-  const currentTextIdRef = useRef<string | null>(null);
-  const forceUpdateRef = useRef(0);
+type Listener = () => void;
 
-  const processLine = (line: string) => {
-    if (!line.trim()) return;
-
-    try {
-      const data = JSON.parse(line);
-      console.log('[STREAMING EVENT]', data.type, new Date().toISOString());
-
-      const now = Date.now();
-      let updated = false;
-
-      // TEXT DELTA - NATYCHMIASTOWA AKTUALIZACJA
-      if (data.type === "text-delta") {
-        if (!currentTextIdRef.current) {
-          const newMsg: Message = {
-            id: `text-${now}-${Math.random()}`,
-            role: "assistant",
-            content: data.delta,
-          };
-          currentTextIdRef.current = newMsg.id;
-          messagesRef.current = [...messagesRef.current, newMsg];
-        } else {
-          messagesRef.current = messagesRef.current.map((msg) =>
-            msg.id === currentTextIdRef.current
-              ? { ...msg, content: msg.content + data.delta }
-              : msg
-          );
-        }
-        updated = true;
-      }
-
-      // TOOL CALL START
-      else if (data.type === "tool-call-start") {
-        currentTextIdRef.current = null;
-        const toolMsg: Message = {
-          id: `tool-${data.toolCallId}-${now}`,
-          role: "assistant",
-          content: "",
-          parts: [{
-            type: "tool-invocation",
-            toolInvocation: {
-              toolCallId: data.toolCallId,
-              toolName: "",
-              args: {},
-              argsText: "",
-              state: "streaming",
-            },
-          }],
-        };
-        messagesRef.current = [...messagesRef.current, toolMsg];
-        updated = true;
-      }
-
-      // TOOL NAME
-      else if (data.type === "tool-name-delta") {
-        messagesRef.current = messagesRef.current.map((msg) => {
-          if (msg.id.includes(data.toolCallId) && msg.parts?.[0]?.type === "tool-invocation") {
-            return {
-              ...msg,
-              parts: [{
-                ...msg.parts[0],
-                toolInvocation: {
-                  ...msg.parts[0].toolInvocation,
-                  toolName: data.toolName,
-                },
-              }],
-            };
-          }
-          return msg;
-        });
-        updated = true;
-      }
-
-      // TOOL ARGUMENTS - KLUCZOWE DLA REAL-TIME STREAMING
-      else if (data.type === "tool-argument-delta") {
-        messagesRef.current = messagesRef.current.map((msg) => {
-          if (msg.id.includes(data.toolCallId) && msg.parts?.[0]?.type === "tool-invocation") {
-            const currentArgsText = msg.parts[0].toolInvocation.argsText || "";
-            const newArgsText = currentArgsText + data.delta;
-            let parsedArgs = msg.parts[0].toolInvocation.args;
-            try {
-              parsedArgs = JSON.parse(newArgsText);
-            } catch (e) {
-              // Keep old args
-            }
-            return {
-              ...msg,
-              parts: [{
-                ...msg.parts[0],
-                toolInvocation: {
-                  ...msg.parts[0].toolInvocation,
-                  argsText: newArgsText,
-                  args: parsedArgs,
-                },
-              }],
-            };
-          }
-          return msg;
-        });
-        updated = true;
-      }
-
-      // TOOL INPUT AVAILABLE
-      else if (data.type === "tool-input-available") {
-        messagesRef.current = messagesRef.current.map((msg) => {
-          if (msg.id.includes(data.toolCallId) && msg.parts?.[0]?.type === "tool-invocation") {
-            return {
-              ...msg,
-              parts: [{
-                ...msg.parts[0],
-                toolInvocation: {
-                  ...msg.parts[0].toolInvocation,
-                  args: data.input,
-                  state: "call",
-                },
-              }],
-            };
-          }
-          return msg;
-        });
-        updated = true;
-      }
-
-      // TOOL OUTPUT
-      else if (data.type === "tool-output-available") {
-        messagesRef.current = messagesRef.current.map((msg) => {
-          if (msg.id.includes(data.toolCallId) && msg.parts?.[0]?.type === "tool-invocation") {
-            return {
-              ...msg,
-              parts: [{
-                ...msg.parts[0],
-                toolInvocation: {
-                  ...msg.parts[0].toolInvocation,
-                  state: "result",
-                  result: data.output,
-                },
-              }],
-            };
-          }
-          return msg;
-        });
-        updated = true;
-      }
-
-      // FINISH
-      else if (data.type === "finish") {
-        setIsStreaming(false);
-      }
-
-      // ERROR
-      else if (data.type === "error") {
-        setIsStreaming(false);
-        if (onError) {
-          onError(new Error(data.errorText || "Streaming error"));
-        }
-      }
-
-      // NATYCHMIASTOWY RERENDER - WYMUSZONY SYNC (BEZ BATCHING)
-      if (updated) {
-        forceUpdateRef.current++;
-        // flushSync - wymusza natychmiastowy render, BLOKUJE React batching
-        flushSync(() => {
-          setMessages([...messagesRef.current]);
-        });
-      }
-
-    } catch (e) {
-      if (!(e instanceof SyntaxError)) {
-        console.error('[PARSE ERROR]', e);
-      }
-    }
+class StreamingStore {
+  private state: StreamingState = {
+    messages: [],
+    input: "",
+    isStreaming: false,
   };
 
-  const send = async (userMessage: string) => {
+  private listeners = new Set<Listener>();
+  private options: UseRawStreamingOptions;
+  private abortController: AbortController | null = null;
+  private currentTextId: string | null = null;
+
+  constructor(options: UseRawStreamingOptions) {
+    this.options = options;
+  }
+
+  updateOptions(options: UseRawStreamingOptions) {
+    this.options = options;
+  }
+
+  subscribe = (listener: Listener) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
+  getSnapshot = () => this.state;
+
+  setInput = (value: string) => {
+    this.updateState({ input: value });
+  };
+
+  stop = () => {
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    this.currentTextId = null;
+    this.updateState({ isStreaming: false });
+  };
+
+  handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    const trimmed = this.state.input.trim();
+    if (!trimmed || this.state.isStreaming) {
+      return;
+    }
+    const message = this.state.input;
+    this.updateState({ input: "" });
+    void this.send(message);
+  };
+
+  send = async (userMessage: string) => {
+    if (this.state.isStreaming) {
+      this.stop();
+    }
+
     const userMsg: Message = {
       id: `user-${Date.now()}-${Math.random()}`,
       role: "user",
       content: userMessage,
     };
 
-    messagesRef.current = [...messagesRef.current, userMsg];
-    setMessages([...messagesRef.current]);
-    setIsStreaming(true);
-    currentTextIdRef.current = null;
+    this.pushMessage(userMsg);
+    this.updateState({ isStreaming: true });
+    this.currentTextId = null;
 
     const abortController = new AbortController();
-    abortControllerRef.current = abortController;
+    this.abortController = abortController;
 
     try {
-      // FETCH API Z READABLESTREAM - NAJLEPSZE DLA STREAMING
-      const response = await fetch(`${api}?_=${Date.now()}`, {
+      const timestamp = Date.now();
+      const payload = {
+        messages: this.state.messages,
+        timestamp,
+        ...this.options.body,
+      };
+
+      const response = await fetch(`${this.options.api}?_=${timestamp}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Cache-Control": "no-cache",
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          Pragma: "no-cache",
+          Expires: "0",
         },
-        body: JSON.stringify({
-          messages: messagesRef.current,
-          timestamp: Date.now(),
-          ...body,
-        }),
+        body: JSON.stringify(payload),
         signal: abortController.signal,
+        cache: "no-store",
       });
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
 
-      const reader = response.body?.getReader();
-      if (!reader) {
+      if (!response.body) {
         throw new Error("No response body");
       }
 
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
 
-      // CZYTAJ STREAM W PĘTLI - REAL-TIME
       while (true) {
         const { done, value } = await reader.read();
-        
         if (done) {
-          // Przetwórz ostatnie dane w buforze
-          if (buffer.trim()) {
-            processLine(buffer);
-          }
           break;
         }
 
-        // Dodaj nowe dane do bufora
         buffer += decoder.decode(value, { stream: true });
-        
-        // Podziel na linie i przetwórz
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
 
         for (const line of lines) {
-          if (line.trim()) {
-            processLine(line);
-          }
+          this.processLine(line);
         }
       }
 
-      setIsStreaming(false);
+      if (buffer.trim()) {
+        this.processLine(buffer);
+      }
 
+      this.updateState({ isStreaming: false });
+      this.currentTextId = null;
+      this.abortController = null;
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        console.log('[STREAMING] Aborted');
-      } else {
-        console.error('[STREAMING ERROR]', error);
-        if (onError) {
-          onError(error instanceof Error ? error : new Error(String(error)));
-        }
+      if ((error as Error).name === "AbortError") {
+        this.abortController = null;
+        return;
       }
-      setIsStreaming(false);
+
+      console.error("[STREAMING ERROR]", error);
+      this.updateState({ isStreaming: false });
+      this.currentTextId = null;
+      this.abortController = null;
+
+      if (this.options.onError) {
+        this.options.onError(error instanceof Error ? error : new Error(String(error)));
+      }
     }
   };
 
-  const stop = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    setIsStreaming(false);
-  };
+  private emit() {
+    this.listeners.forEach((listener) => listener());
+  }
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isStreaming) return;
-    const userInput = input;
-    setInput("");
-    send(userInput);
-  };
+  private updateState(partial: Partial<StreamingState>) {
+    this.state = { ...this.state, ...partial };
+    this.emit();
+  }
+
+  private pushMessage(message: Message) {
+    this.state = { ...this.state, messages: [...this.state.messages, message] };
+    this.emit();
+  }
+
+  private replaceMessage(id: string, updater: (message: Message) => Message) {
+    const updated = this.state.messages.map((message) =>
+      message.id === id ? updater(message) : message
+    );
+    this.state = { ...this.state, messages: updated };
+    this.emit();
+  }
+
+  private processLine(rawLine: string) {
+    const line = rawLine.trim();
+    if (!line) {
+      return;
+    }
+
+    try {
+      const data = JSON.parse(line);
+      const now = Date.now();
+
+      if (data.type === "text-delta") {
+        if (!this.currentTextId) {
+          const newMsg: Message = {
+            id: `text-${now}-${Math.random()}`,
+            role: "assistant",
+            content: data.delta,
+          };
+          this.currentTextId = newMsg.id;
+          this.pushMessage(newMsg);
+        } else {
+          this.replaceMessage(this.currentTextId, (message) => ({
+            ...message,
+            content: `${message.content}${data.delta}`,
+          }));
+        }
+        return;
+      }
+
+      if (data.type === "tool-call-start") {
+        this.currentTextId = null;
+        const toolMsg: Message = {
+          id: `tool-${data.toolCallId}-${now}`,
+          role: "assistant",
+          content: "",
+          parts: [
+            {
+              type: "tool-invocation",
+              toolInvocation: {
+                toolCallId: data.toolCallId,
+                toolName: "",
+                args: {},
+                argsText: "",
+                state: "streaming",
+              },
+            },
+          ],
+        };
+        this.pushMessage(toolMsg);
+        return;
+      }
+
+      if (data.type === "tool-name-delta") {
+        this.updateToolInvocation(data.toolCallId, (invocation) => ({
+          ...invocation,
+          toolName: data.toolName,
+        }));
+        return;
+      }
+
+      if (data.type === "tool-argument-delta") {
+        this.updateToolInvocation(data.toolCallId, (invocation) => {
+          const currentText = invocation.argsText ?? "";
+          const nextText = `${currentText}${data.delta}`;
+          let parsedArgs = invocation.args;
+          try {
+            parsedArgs = JSON.parse(nextText);
+          } catch {
+            parsedArgs = invocation.args;
+          }
+          return {
+            ...invocation,
+            argsText: nextText,
+            args: parsedArgs,
+          };
+        });
+        return;
+      }
+
+      if (data.type === "tool-input-available") {
+        this.updateToolInvocation(data.toolCallId, (invocation) => ({
+          ...invocation,
+          args: data.input,
+          state: "call",
+        }));
+        return;
+      }
+
+      if (data.type === "tool-output-available") {
+        this.updateToolInvocation(data.toolCallId, (invocation) => ({
+          ...invocation,
+          state: "result",
+          result: data.output,
+        }));
+        return;
+      }
+
+      if (data.type === "finish") {
+        this.updateState({ isStreaming: false });
+        this.currentTextId = null;
+        return;
+      }
+
+      if (data.type === "error") {
+        this.updateState({ isStreaming: false });
+        this.currentTextId = null;
+        if (this.options.onError) {
+          this.options.onError(new Error(data.errorText || "Streaming error"));
+        }
+        return;
+      }
+    } catch (error) {
+      console.error("[STREAM PARSE ERROR]", error);
+    }
+  }
+
+  private updateToolInvocation(toolCallId: string, updater: (invocation: any) => any) {
+    const updated = this.state.messages.map((message) => {
+      if (!message.parts || message.parts.length === 0) {
+        return message;
+      }
+
+      const updatedParts = message.parts.map((part: any) => {
+        if (part?.type === "tool-invocation" && part.toolInvocation?.toolCallId === toolCallId) {
+          return {
+            ...part,
+            toolInvocation: updater(part.toolInvocation),
+          };
+        }
+        return part;
+      });
+
+      return {
+        ...message,
+        parts: updatedParts,
+      };
+    });
+
+    this.state = { ...this.state, messages: updated };
+    this.emit();
+  }
+}
+
+export function useRawStreaming(options: UseRawStreamingOptions) {
+  const storeRef = useRef<StreamingStore>();
+
+  if (!storeRef.current) {
+    storeRef.current = new StreamingStore(options);
+  } else {
+    storeRef.current.updateOptions(options);
+  }
+
+  const store = storeRef.current;
+  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
   return {
-    messages,
-    input,
-    setInput,
-    handleSubmit,
-    isStreaming,
-    stop,
-    send,
-    setMessages: (msgs: Message[]) => {
-      messagesRef.current = msgs;
-      setMessages(msgs);
-    },
+    messages: snapshot.messages,
+    input: snapshot.input,
+    isStreaming: snapshot.isStreaming,
+    setInput: store.setInput,
+    stop: store.stop,
+    handleSubmit: store.handleSubmit,
+    send: store.send,
   };
 }

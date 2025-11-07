@@ -1,6 +1,5 @@
 import { ArrowUpRight } from "lucide-react";
 import { Button } from "./ui/button";
-import { memo } from "react";
 
 const suggestions = [
   {
@@ -17,7 +16,7 @@ const suggestions = [
   },
 ];
 
-export const PromptSuggestions = memo(function PromptSuggestions({
+export function PromptSuggestions({
   submitPrompt,
   disabled,
 }: {
@@ -44,4 +43,4 @@ export const PromptSuggestions = memo(function PromptSuggestions({
       ))}
     </div>
   );
-});
+}
